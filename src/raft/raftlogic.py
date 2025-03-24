@@ -8,7 +8,7 @@ import pytest
 @dataclass
 class AppendEntriesRequest:
     term: int                   # Sender of the message
-    leader_id: int              # Destination fo the message
+    leader_id: int              # leader's server id
     prev_log_index: int         # leader's term
     prev_log_term: int          # index of log entry immediately preceding new ones
     leader_commit:  int         # term of prev_log_index entry
@@ -20,6 +20,20 @@ class AppendEntriesResponse:
     success: bool               # true if follower contained entry matching prev_log_index and prev_log_term
     responder_id: bool          # id of the responder. This is helpful since we're using actor model messaging
     last_log_idx: int           # index of the last updated log entry. Only necessary when the append-entries request is successful
+
+@dataclass
+class RequestVoteRequest:
+    term: int                   # current term of the candidate
+    candidate_id: int           # candidate's server id
+    last_log_term: int          # candidate's last log term
+    last_log_index: int         # candidate's last log index
+
+@dataclass
+class RequestVoteResponse:
+    term: int                   # current term, for the candidate to update itself
+    vote_granted: bool          # true means candidate received vote
+    vote_from: int              # the id of the server that voted
+    vote_term: int              # the term for which the vote was cast
 
 class Role(Enum):
     FOLLOWER = 1
@@ -44,6 +58,7 @@ class RaftLogic:
         # Volatile state on all servers
         self.commit_index = 0
         self.last_applied = 0
+        self.votes = 0
 
         # volatile state on all leaders
         self.next_index = { n: 1 for n in range(1, cluster_size + 1) }
@@ -94,7 +109,7 @@ class RaftLogic:
     
     def queue_request(self, server: int, request: any):
         """
-        adds an rpc request/response to the execution queue for processing or sending over the network.
+        Adds an rpc request/response to the execution queue for processing or sending over the network.
 
         A server can either send a request over the network to a different server in the raft network
         by specifying the server's node number or queue a request for self-processing
@@ -111,7 +126,9 @@ class RaftLogic:
         Handles a raft AppendEntries request. The request is unsuccessful if
         the sender's current term is less than the server's term. Otherwise it is
         processed and the success of the request is determined by the parity between
-        the log entries in the leader (request sender) and the current server
+        the log entries in the leader (request sender) and the current server.
+
+        The current server is also converted to a follower if it's term is less than the requester's term
 
             Parameters:
                 msg: the AppendEntries request
@@ -134,8 +151,11 @@ class RaftLogic:
                                 responder_id = self.nodenum,
                                 last_log_idx = self.log.get_last_log_index(),
                         )
-            
-            self.current_term = msg.term
+        
+        if self.current_term < msg.term:
+            self.update_current_term(msg.term)
+            if not self.is_follower():
+                self.become_follower()
         
         self.queue_request(msg.leader_id, response)
 
@@ -152,7 +172,7 @@ class RaftLogic:
         is made to the requested server
         """
         if self.current_term < response.term:
-            self.current_term = response.term
+            self.update_current_term(response.term)
             self.become_follower()
             return
         if response.success == False:
@@ -164,9 +184,85 @@ class RaftLogic:
         self.match_index[response.responder_id] = response.last_log_idx
         self.attempt_commit()
     
+    def handle_vote_request_request(self, msg: RequestVoteRequest):
+        """
+        Handles a Vote request from another server.
+        There are three scenarios to handle here (in order):
+
+        
+            1. If the candidate's term is less than the current server's term, a failure
+                response is immediately returned
+            2. If the candidate has previously voted for the request term, return a success
+                response if the vote was for the current requester, false otherwise
+            3. If the candidate's log is at least up to date with the current log, the vote is granted,
+                else the vote is not granted
+
+            Parameters:
+                msg: the AppendEntries RequestVoteRequest
+        """
+        candidate_log_up_to_date = lambda: msg.last_log_term > self.log.get_last_term() or \
+                                    (msg.last_log_term == self.log.get_last_term() and msg.last_log_index >= self.log.get_last_log_index())
+        
+        if self.current_term > msg.term:
+            response = RequestVoteResponse(
+                term=self.current_term,
+                vote_granted=False,
+                vote_from=self.nodenum,
+                vote_term=msg.term
+            )
+        elif self.current_term == msg.term:
+            if self.voted_for != None:
+                response = RequestVoteResponse(
+                    term=self.current_term,
+                    vote_granted=self.voted_for == msg.candidate_id,
+                    vote_from=self.nodenum,
+                    vote_term=msg.term
+                )
+            else:
+                self.update_current_term(self.current_term, msg.term if candidate_log_up_to_date() else None)
+                response = RequestVoteResponse(
+                    term=self.current_term,
+                    vote_granted=candidate_log_up_to_date(),
+                    vote_from=self.nodenum,
+                    vote_term=msg.term
+                )
+        else: # it means we haven't seen anything for this term, including any RequestVote request for this term up till now.
+            former_term = self.current_term
+            self.update_current_term(msg.term, msg.candidate_id if candidate_log_up_to_date() else None)
+            self.become_follower()
+            response = RequestVoteResponse(
+                term=former_term,
+                vote_granted=candidate_log_up_to_date(),
+                vote_from=self.nodenum,
+                vote_term=msg.term
+            )
+        
+        self.queue_request(msg.candidate_id, response)
+    
+    def handle_vote_request_response(self, msg: RequestVoteResponse):
+        """
+        Handles a VoteRequest response from another server in the raft cluster
+        There are two scenarios to handle here (in order).
+
+            1. The term in the response is higher than the current server's term. In this case, the
+                current server is demoted to follower and its term is updated
+            2. Update the accrued vote count for the user and promote to leader if the vote count is greater
+                than half the cluster size
+        """
+        if self.current_term < msg.term:
+            self.update_current_term(msg.term)
+            if not self.is_follower():
+                self.become_follower()
+        
+        if not self.is_candidate() or self.current_term != msg.vote_term:
+            return
+        
+        self.votes += 1
+        if self.votes > self.cluster_size // 2:
+            self.become_leader()
+    
     def attempt_commit(self):
         """
-
         This is invoked after processing a successful `append_entries` response.
         The current raft server's commit index is updated if majority servers have reached the desired commit
         index AND if the server's commit index is behind the desired index
@@ -243,6 +339,18 @@ class RaftLogic:
         Indicates whether the current server is a candidate
         """
         return self.role == Role.CANDIDATE
+    
+    def update_current_term(self, term, vote_for: int = None):
+        """
+        Updates the current term of the server and sets the vote for the current term
+        if it is provided, else sets the current vote to None
+
+            Parameters:
+                term: the server's new term
+                vote_for: optional vote for the current term
+        """
+        self.current_term = term
+        self.voted_for = vote_for
 
 def test_handle_append_entries():
     logic = RaftLogic(nodenum=1, cluster_size=3)
@@ -420,6 +528,197 @@ def test_update_follower():
                                                 )
                                             )
 
+def test_handle_vote_request_request():
+
+    logic = RaftLogic(nodenum=1, cluster_size=3)
+
+    # assert that the candidate's term must be less than the server's term for a vote to be granted
+    logic.update_current_term(term=1)
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=0,
+                                            candidate_id=2,
+                                            last_log_term=0,
+                                            last_log_index=0,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=False,
+                                                vote_from=1,
+                                                vote_term=0
+                                            )
+                                        )
+    
+    # If the candidate has previously voted for the request term and the vote was for the requestor, return a success
+    logic.update_current_term(term=1, vote_for=2)
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=0,
+                                            last_log_index=0,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=True,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+    
+    # If the candidate has previously voted for the request term and the vote was not the requestor, return a failure
+    logic.update_current_term(term=1, vote_for=1)
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=0,
+                                            last_log_index=0,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=False,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+    
+    # If the requestor presents a higher term, grant vote if the requestor's log is up-to-date
+    logic.update_current_term(0, 1)
+    logic.log.append_command(1, 'x=1')
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=1,
+                                            last_log_index=1,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=0,
+                                                vote_granted=True,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+    
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=2,
+                                            last_log_index=1,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=True,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+    
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=1,
+                                            last_log_index=2,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=True,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+    
+    # If the requestor presents a higher term, reject request if the requestor's log is not up-to-date
+    logic.update_current_term(1, 1)
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=0,
+                                            last_log_index=0,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=False,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+    
+    logic.handle_vote_request_request(RequestVoteRequest(
+                                            term=1,
+                                            candidate_id=2,
+                                            last_log_term=1,
+                                            last_log_index=0,
+                                        )
+                                    )
+    assert logic._request_queue.pop() == (2, RequestVoteResponse(
+                                                term=1,
+                                                vote_granted=False,
+                                                vote_from=1,
+                                                vote_term=1
+                                            )
+                                        )
+
+def test_handle_vote_request_response():
+
+    logic = RaftLogic(nodenum=1, cluster_size=3)
+
+    # if the response term is greater than the current server's term, the current server is converted to a follower
+    logic.become_candidate()
+    logic.handle_vote_request_response(RequestVoteResponse(
+                                            term=1,
+                                            vote_granted=False,
+                                            vote_from=2,
+                                            vote_term=0
+                                        )
+                                    )
+    assert not logic.is_candidate()
+    assert logic.is_follower()
+    assert logic.votes == 0
+
+    # if the vote_term is less than the current server's term, we ignore the response
+    logic.become_candidate()
+    logic.update_current_term(term=1)
+    logic.handle_vote_request_response(RequestVoteResponse(
+                                            term=0,
+                                            vote_granted=True,
+                                            vote_from=2,
+                                            vote_term=0
+                                        )
+                                    )
+    assert logic.votes == 0
+    
+    # if the current server is no longer a candidate, we ignore the response
+    logic.become_leader()
+    logic.update_current_term(term=1)
+    logic.handle_vote_request_response(RequestVoteResponse(
+                                            term=1,
+                                            vote_granted=True,
+                                            vote_from=2,
+                                            vote_term=1
+                                        )
+                                    )
+    assert logic.votes == 0
+
+    # happy case: the current server is in the right term and is a candidate. We record the number of votes
+    logic.become_candidate()
+    logic.votes = 1
+    logic.handle_vote_request_response(RequestVoteResponse(
+                                            term=1,
+                                            vote_granted=True,
+                                            vote_from=2,
+                                            vote_term=1
+                                        )
+                                    )
+    assert logic.votes == 2
+    # 2 votes is a majority, so the server should get promoted to leader
+    assert logic.is_leader()
+
+
 def test_update_commit_index():
     # update should fail if the current server is not leader
     logic = RaftLogic(nodenum=1, cluster_size=5)
@@ -460,3 +759,5 @@ if __name__ == "__main__":
     test_handle_append_entries_response()
     test_update_follower()
     test_update_commit_index()
+    test_handle_vote_request_request()
+    test_handle_vote_request_response()
