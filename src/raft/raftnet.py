@@ -52,8 +52,9 @@ class RaftNetActor:
     
     # Servers must be able to send a message to another server
     def send(self, destination: int, msg: bytes):
+
+        sock = socket(AF_INET, SOCK_STREAM)
         try:
-            sock = socket(AF_INET, SOCK_STREAM)
             sock.connect(raftconfig.SERVERS[destination])
             # We send a message...
             message.send_message(sock, msg) # This is from Project 1/Warmup
@@ -66,10 +67,15 @@ class RaftNetActor:
     # A server must be able to respond to a message received from another
     # servere
     def receive(self) -> bytes:
-        client, addr = self.sock.accept()
-        msg = message.recv_message(client)
-        client.close()
-        return msg
+        client, addr = (None,None)
+        try:
+            client, addr = self.sock.accept()
+            msg = message.recv_message(client)
+            return msg
+        except IOError as e:
+            print(e)
+        finally:
+            client.close()
 
 
 def console(nodenum):

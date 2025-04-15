@@ -27,7 +27,8 @@ class RaftLog:
                 break
             idx += 1
             append_idx += 1
-        self.entries = self.entries[:idx] + entries[append_idx:]
+        if append_idx < len(entries): # a conflict was found
+            self.entries = self.entries[:idx] + entries[append_idx:]
 
         return True
     

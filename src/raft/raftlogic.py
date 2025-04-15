@@ -4,6 +4,9 @@ import raftconfig
 from enum import Enum
 from collections import deque, defaultdict
 import pytest
+import threading
+import time
+import random
 
 @dataclass
 class AppendEntriesRequest:
@@ -41,14 +44,21 @@ class Role(Enum):
     LEADER = 3
 
 class RaftLogic:
-    def __init__(self, nodenum: int, cluster_size: int):
+    def __init__(self, nodenum: int, cluster_size: int, manual_mode=True, debug_mode=False):
 
         assert cluster_size > 0 and cluster_size % 2 == 1 # We must have a non-empty and even raft cluster size
 
         self.role = Role.FOLLOWER
+        self.role_lock = threading.Lock()
         self.nodenum = nodenum
         self.cluster_size = cluster_size
         self._request_queue = deque([])
+        # in raft, the follower waits expects a heartbeat message within the election timeout, it becomes a candidate. If it doesn't get it, it 
+        self.election_timeout_low = .150
+        self.election_timeout_high = .240
+        self.last_heartbeat_time = time.time()
+        self.last_timeout_checkpoint = time.time()
+        self.heartbeat_interval = .01
 
         # Persistent states
         self.current_term = 0
@@ -63,6 +73,149 @@ class RaftLogic:
         # volatile state on all leaders
         self.next_index = { n: 1 for n in range(1, cluster_size + 1) }
         self.match_index = { n: 0 for n in range(1, cluster_size + 1) }
+
+        
+        # start election threads
+        self.app_running_event = threading.Event()
+        self.follower_check_event = threading.Event()
+        self.candidate_check_event = threading.Event()
+        self.leader_check_event = threading.Event()
+
+        self.candidate_thread = threading.Thread(target=self.run_candidate_loop)
+        self.follower_thread = threading.Thread(target=self.run_follower_loop)
+        self.leader_thread = threading.Thread(target=self.run_leader_loop)
+
+        if not manual_mode:
+            self.app_running_event.set()
+        self.candidate_thread.start()
+        self.follower_thread.start()
+        self.leader_thread.start()
+
+        # for auto mode, start the concensus mechanism immediately after initialization.
+        # every one starts as follower
+        if not manual_mode:
+            self.become_follower()
+            
+        self.debug_mode = debug_mode
+
+    def run_follower_loop(self):
+        """
+        Runs the concensus loop whenever the current server is a follower.
+        The concensus loop for a follower in a raft cluster involves checking
+        for heartbeats and starting an election if necessary
+        """
+
+        calculate_timeout = lambda: self.election_timeout_low  + random.random() * (self.election_timeout_high - self.election_timeout_low) # randomized election timeout
+
+        while self.app_running_event.is_set():
+            self.follower_check_event.wait()
+            timeout = calculate_timeout() # randomized election timeout
+            time.sleep(timeout)
+            self._run_heartbeat_check()
+            
+            self.last_timeout_checkpoint = time.time()
+
+    def _run_heartbeat_check(self):
+        """
+        Checks for a heartbeat from the cluster leader. If no heartbeat is found, the current
+        server is converted to a candidate 
+        """
+        if self.last_heartbeat_time < self.last_timeout_checkpoint:
+            with self.role_lock:
+                if self.is_follower():
+                    self.become_candidate()
+    
+    def run_candidate_loop(self):
+        """
+        Runs the candidate concensus loop whenever the current server is a candidate in an election cycle.
+
+        The concensus loop for a candidate in a raft cluster involves carrying participating
+        in an election by requesting votes and promoting the current server from candidate to leader
+        if it has enough votes for the term. 
+        """
+        calculate_timeout = lambda: self.election_timeout_low  + random.random() * (self.election_timeout_high - self.election_timeout_low)
+        expiration_time = time.time() + calculate_timeout()
+        sent_request = False
+        curr_term = 0
+        
+        while self.app_running_event.is_set():
+            self.candidate_check_event.wait()
+            curr_term, expiration_time, sent_request = self._run_election_check(curr_term, expiration_time, sent_request)
+            time.sleep(.01) # TODO: change this
+    
+    def _run_election_check(self, curr_term, expiration_time, sent_request) -> tuple[int, int, bool]:
+
+        """
+        Handles the following election cases (in order)
+
+        1. the server's current term is higher than the election term is seen, in which case we reset the timeout and change the election term
+        2. the election timeout elapses, in which case, we start another election
+        3. the current server gains a majority of votes, in which case it is then promoted to leader
+        4. the current server is no longer a candidate, in which case it waits until it is candidate again before resuming iteration
+        5. vote requests haven't been sent for the current election term, so we send the requests
+        
+        :returns updated (curr_term, expiration_time, sent_request) tuple
+        """
+        calculate_timeout = lambda: self.election_timeout_low  + random.random() * (self.election_timeout_high - self.election_timeout_low) # randomized election timeout
+        has_majority_votes = lambda: self.votes > self.cluster_size // 2
+
+        with self.role_lock:
+            
+            if not self.is_candidate():
+                return curr_term, expiration_time, sent_request
+
+            # we're sure that the current server is a candidate
+            curr_time = time.time()
+            if curr_term < self.current_term: # this also resets the expiration time for when 
+                # reset the timeout.
+                curr_term = self.current_term
+                expiration_time += calculate_timeout()
+                sent_request = False
+            elif curr_time > expiration_time: # reset time and restart candidacy
+                self.become_candidate() # This should also update the current term
+                curr_term = self.current_term
+                expiration_time = curr_time + calculate_timeout()
+                self.last_timeout_checkpoint = curr_time
+                sent_request = False
+            elif has_majority_votes():
+                self.become_leader()
+                sent_request = False
+            elif not sent_request:
+                try: # opting to avoid using locks here. if the log gets shortened before we can get the last term, we simply skip the current iteration. candidacy shouldn't be as frequent, so this is less expensive
+                    last_idx = self.log.get_last_log_index()
+                    last_term = self.log.get_entry(last_idx).term
+
+                    if last_term <= curr_term: # check that we're still within valid voting constraints (side-effect of not using the log lock)
+                        self.request_votes(curr_term, last_term, last_idx)
+                        sent_request = True
+                except:
+                    pass
+        return curr_term, expiration_time, sent_request
+    
+    def run_leader_loop(self):
+        """
+        Runs the leader concensus loop whenever the current server is a leader.
+         
+        The concensus loop for the leader in a raft cluster involves the leader consistently sending heartbetas
+        to other servers within the cluster to signal that it is still alive and therefore still
+        leader of the current term. 
+        """
+        while self.app_running_event.is_set():
+            self.leader_check_event.wait()
+            self._send_heartbeats()
+            time.sleep(self.heartbeat_interval)
+    
+    def _send_heartbeats(self):
+
+        """
+        Sends regular heartbeats to followers
+        """
+        for server in range(1, self.cluster_size + 1):
+            if not self.is_leader():
+                break
+            if server == self.nodenum:
+                continue
+            self.update_follower(server, heartbeat=True)
 
     def add_new_command(self, command: str):
         """
@@ -128,11 +281,12 @@ class RaftLogic:
         processed and the success of the request is determined by the parity between
         the log entries in the leader (request sender) and the current server.
 
-        The current server is also converted to a follower if it's term is less than the requester's term
+        The current server is also converted to a follower if its term is less than the requester's term
 
             Parameters:
                 msg: the AppendEntries request
         """
+        
 
         if self.current_term > msg.term:
             response = AppendEntriesResponse(
@@ -151,11 +305,13 @@ class RaftLogic:
                                 responder_id = self.nodenum,
                                 last_log_idx = self.log.get_last_log_index(),
                         )
+            self.last_heartbeat_time = time.time() # set last hearbeat time
         
-        if self.current_term < msg.term:
-            self.update_current_term(msg.term)
-            if not self.is_follower():
-                self.become_follower()
+        with self.role_lock:
+            if self.current_term < msg.term:
+                self.update_current_term(msg.term)
+                if not self.is_follower():
+                    self.become_follower()
         
         self.queue_request(msg.leader_id, response)
 
@@ -164,25 +320,41 @@ class RaftLogic:
         """
         Handles an AppendEntries response from another server in the raft network.
 
-        If the request is updated 
-
         If the request is successful, the next_index and match_index for the requested server
         is updated, otherwise the current server is either demoted to follower -
         if the current term is less than the response term - or a follow-up AppendEntries request
         is made to the requested server
         """
-        if self.current_term < response.term:
-            self.update_current_term(response.term)
-            self.become_follower()
-            return
-        if response.success == False:
-            self.next_index[response.responder_id] -= 1
-            self.update_follower(response.responder_id)
-            return
-        
-        self.next_index[response.responder_id] = response.last_log_idx + 1
-        self.match_index[response.responder_id] = response.last_log_idx
-        self.attempt_commit()
+        with self.role_lock:
+            if not self.is_leader():
+                return
+            
+            if self.current_term < response.term:
+                self.update_current_term(response.term)
+                self.become_follower()
+                return
+            if response.success == False:
+                self.next_index[response.responder_id] -= 1
+                self.update_follower(response.responder_id)
+                return
+            
+            self.next_index[response.responder_id] = response.last_log_idx + 1
+            self.match_index[response.responder_id] = response.last_log_idx
+            self.attempt_commit()
+    
+    def request_votes(self, term: int, last_log_term: int, last_log_idx: int):
+        for server in range(1, self.cluster_size + 1):
+            if server == self.nodenum:
+                continue
+
+            self.queue_request(server,
+                                RequestVoteRequest(
+                                    term=term,
+                                    candidate_id=self.nodenum,
+                                    last_log_term=last_log_term,
+                                    last_log_index=last_log_idx
+                                )
+            )
     
     def handle_vote_request_request(self, msg: RequestVoteRequest):
         """
@@ -203,39 +375,47 @@ class RaftLogic:
         candidate_log_up_to_date = lambda: msg.last_log_term > self.log.get_last_term() or \
                                     (msg.last_log_term == self.log.get_last_term() and msg.last_log_index >= self.log.get_last_log_index())
         
-        if self.current_term > msg.term:
-            response = RequestVoteResponse(
-                term=self.current_term,
-                vote_granted=False,
-                vote_from=self.nodenum,
-                vote_term=msg.term
-            )
-        elif self.current_term == msg.term:
-            if self.voted_for != None:
+
+        with self.role_lock:
+            if self.current_term > msg.term:
                 response = RequestVoteResponse(
                     term=self.current_term,
-                    vote_granted=self.voted_for == msg.candidate_id,
+                    vote_granted=False,
                     vote_from=self.nodenum,
                     vote_term=msg.term
                 )
-            else:
-                self.update_current_term(self.current_term, msg.term if candidate_log_up_to_date() else None)
+            elif self.current_term == msg.term:
+                if self.voted_for != None:
+                    if self.debug_mode:
+                        print('rejected vote request from ', msg.candidate_id, ' for term ', msg.term, ' because already voted for ', self.voted_for)
+                    response = RequestVoteResponse(
+                        term=self.current_term,
+                        vote_granted=self.voted_for == msg.candidate_id,
+                        vote_from=self.nodenum,
+                        vote_term=msg.term
+                    )
+                else:
+                    self.update_current_term(self.current_term, msg.term if candidate_log_up_to_date() else None)
+                    if self.debug_mode and candidate_log_up_to_date():
+                        print('granted vote to ', msg.candidate_id, ' for term ', msg.term)
+                    response = RequestVoteResponse(
+                        term=self.current_term,
+                        vote_granted=candidate_log_up_to_date(),
+                        vote_from=self.nodenum,
+                        vote_term=msg.term
+                    )
+            else: # it means we haven't seen anything for this term, including any RequestVote request for this term up till now.
+                former_term = self.current_term
+                self.update_current_term(msg.term, msg.candidate_id if candidate_log_up_to_date() else None)
+                self.become_follower()
+                if self.debug_mode and candidate_log_up_to_date():
+                    print('granted vote to ', msg.candidate_id, ' for term ', msg.term)
                 response = RequestVoteResponse(
-                    term=self.current_term,
+                    term=former_term,
                     vote_granted=candidate_log_up_to_date(),
                     vote_from=self.nodenum,
                     vote_term=msg.term
                 )
-        else: # it means we haven't seen anything for this term, including any RequestVote request for this term up till now.
-            former_term = self.current_term
-            self.update_current_term(msg.term, msg.candidate_id if candidate_log_up_to_date() else None)
-            self.become_follower()
-            response = RequestVoteResponse(
-                term=former_term,
-                vote_granted=candidate_log_up_to_date(),
-                vote_from=self.nodenum,
-                vote_term=msg.term
-            )
         
         self.queue_request(msg.candidate_id, response)
     
@@ -246,20 +426,19 @@ class RaftLogic:
 
             1. The term in the response is higher than the current server's term. In this case, the
                 current server is demoted to follower and its term is updated
-            2. Update the accrued vote count for the user and promote to leader if the vote count is greater
-                than half the cluster size
+            2. Otherwise, update the vote counts for the current server
         """
-        if self.current_term < msg.term:
-            self.update_current_term(msg.term)
-            if not self.is_follower():
-                self.become_follower()
+        with self.role_lock:
+            if self.current_term < msg.term:
+                self.update_current_term(msg.term)
+                if not self.is_follower():
+                    self.become_follower()
+            
+            if not self.is_candidate() or self.current_term != msg.vote_term:
+                return
         
-        if not self.is_candidate() or self.current_term != msg.vote_term:
-            return
-        
-        self.votes += 1
-        if self.votes > self.cluster_size // 2:
-            self.become_leader()
+            if msg.vote_granted:
+                self.votes += 1
     
     def attempt_commit(self):
         """
@@ -310,6 +489,13 @@ class RaftLogic:
         self.match_index[self.nodenum] = self.current_term
         self.role = Role.LEADER
 
+        if self.debug_mode:
+            print('becoming leader')
+        # start sending heartbeats to followers
+        self.candidate_check_event.clear()
+        self.follower_check_event.clear()
+        self.leader_check_event.set()
+
     def is_leader(self) -> bool:
         """
         Indicates whether the current server is a leader
@@ -322,17 +508,33 @@ class RaftLogic:
         """
         self.role = Role.FOLLOWER
 
+        if self.debug_mode:
+            print('becoming follower')
+        # start monitoring heartbeats
+        self.candidate_check_event.clear()
+        self.leader_check_event.clear()
+        self.follower_check_event.set()
+
     def is_follower(self) -> bool:
         """
         Indicates whether the current server is a follower
         """
         return self.role == Role.FOLLOWER
     
-    def become_candidate(self):
+    def become_candidate(self) -> int:
         """
         Changes the current server's role to candidate
         """
         self.role = Role.CANDIDATE
+
+        if self.debug_mode:
+            print('becoming candidate')
+        # start election cycle
+        self.follower_check_event.clear()
+        self.leader_check_event.clear()
+        self.candidate_check_event.set()
+
+        self.update_current_term(self.current_term + 1, self.nodenum) # update current term and vote for self
 
     def is_candidate(self) -> bool:
         """
@@ -350,7 +552,21 @@ class RaftLogic:
                 vote_for: optional vote for the current term
         """
         self.current_term = term
+        if vote_for:
+            self.votes = 1
+        else:
+            self.votes = 0
         self.voted_for = vote_for
+    
+    def __del__(self):
+        self.app_running_event.clear()
+        self.follower_check_event.set()
+        self.candidate_check_event.set()
+        self.leader_check_event.set()
+
+        self.follower_thread.join()
+        self.candidate_thread.join()
+        self.leader_thread.join()
 
 def test_handle_append_entries():
     logic = RaftLogic(nodenum=1, cluster_size=3)
@@ -670,7 +886,7 @@ def test_handle_vote_request_response():
     # if the response term is greater than the current server's term, the current server is converted to a follower
     logic.become_candidate()
     logic.handle_vote_request_response(RequestVoteResponse(
-                                            term=1,
+                                            term=2,
                                             vote_granted=False,
                                             vote_from=2,
                                             vote_term=0
@@ -704,20 +920,27 @@ def test_handle_vote_request_response():
                                     )
     assert logic.votes == 0
 
-    # happy case: the current server is in the right term and is a candidate. We record the number of votes
+    # If the vote was rejected, we don't increment the votes
     logic.become_candidate()
     logic.votes = 1
     logic.handle_vote_request_response(RequestVoteResponse(
-                                            term=1,
+                                            term=2,
+                                            vote_granted=False,
+                                            vote_from=2,
+                                            vote_term=2
+                                        )
+                                    )
+    assert logic.votes == 1
+
+    # happy case: the current server is in the right term and is a candidate. We increment the number of votes
+    logic.handle_vote_request_response(RequestVoteResponse(
+                                            term=2,
                                             vote_granted=True,
                                             vote_from=2,
-                                            vote_term=1
+                                            vote_term=2
                                         )
                                     )
     assert logic.votes == 2
-    # 2 votes is a majority, so the server should get promoted to leader
-    assert logic.is_leader()
-
 
 def test_update_commit_index():
     # update should fail if the current server is not leader
@@ -753,6 +976,109 @@ def test_update_commit_index():
     logic.attempt_commit()
     assert logic.commit_index == 3
 
+def test_run_heartbeat_check():
+    logic = RaftLogic(nodenum=1, cluster_size=3)
+
+    # if role is follower and the last heartbeat occurs on or after the last timeout checkpoint (doesn't matter which)
+    # the server is not converted to candidate
+    logic.become_follower()
+    logic.last_heartbeat_time = time.time()
+    assert logic.election_timeout_low > 0 # cautionary assertion to prevent us from setting the election_timeout too low
+    logic.last_timeout_checkpoint = logic.last_heartbeat_time
+    logic._run_heartbeat_check()
+    assert logic.is_follower()
+
+    # if role is not follower and the last heartbeat occured before the last timeout checkpoint
+    # the server is not converted to candidate
+    logic.become_leader()
+    logic.last_heartbeat_time = time.time()
+    logic.last_timeout_checkpoint = logic.last_heartbeat_time + .001
+    logic._run_heartbeat_check()
+    assert logic.is_leader()
+
+    # Happy Case:
+    # if the role is follower and the last heartbeat occured before the last timeout checkpoint
+    # the server is converted to candidate
+    logic.become_follower()
+    logic.last_heartbeat_time = time.time()
+    logic.last_timeout_checkpoint = logic.last_heartbeat_time + .001
+    logic._run_heartbeat_check()
+    assert logic.is_candidate()
+
+def test_run_election_check():
+    logic = RaftLogic(nodenum=1, cluster_size=3)
+    logic.become_candidate()
+
+    # the server's current term is higher than the election term is seen
+    # so we expect the timeout to be reset and the election term changed
+    curr_term, expiration_time, sent_request = 0, time.time() + 15000, False
+    recv_term, recv_time, req_sent = logic._run_election_check(curr_term, expiration_time, sent_request)
+    assert curr_term != logic.current_term
+    assert recv_term == logic.current_term and recv_time > expiration_time and req_sent == False
+
+    # terms are aligned but election time has elapsed
+    curr_term, expiration_time = logic.current_term, time.time() - 3000
+    assert curr_term == logic.current_term
+    recv_term, recv_time, req_sent = logic._run_election_check(curr_term, expiration_time, sent_request)
+    assert logic.current_term > curr_term # candidacy is reset
+    assert recv_term == logic.current_term and recv_time > expiration_time and req_sent == False
+
+    # terms are aligned and election time has not elapsed, but the server doesn't have a majority of votes
+    # we expect the server to remain a candidate and for the time or term not to be changed
+    # but we also expect the server to have sent the request
+    curr_term, expiration_time = logic.current_term, time.time() + 3000
+    assert curr_term == logic.current_term
+    recv_term, recv_time, req_sent = logic._run_election_check(curr_term, expiration_time, sent_request)
+    assert curr_term == logic.current_term
+    assert recv_term == curr_term and recv_time == expiration_time and req_sent == True
+    assert logic.is_candidate()
+    assert len(logic._request_queue) > 0 and logic._request_queue[0][0] == 2 and logic._request_queue[1][0] == 3
+
+    # terms are aligned and election time has not elapsed, but the server has the majority votes
+    # we expect the server to become a leader for the current term
+    curr_term, expiration_time = logic.current_term, time.time() + 3000
+    logic.votes = 2
+    assert curr_term == logic.current_term
+    recv_term, recv_time, req_sent = logic._run_election_check(curr_term, expiration_time, sent_request)
+    assert curr_term == logic.current_term
+    assert recv_term == curr_term and recv_time == expiration_time and req_sent == False
+    assert logic.is_leader()
+
+def test_send_heartbeats():
+    logic = RaftLogic(nodenum=1, cluster_size=3)
+    # does not send heartbeats if the current server is not a leader
+    logic.become_follower()
+    logic._send_heartbeats()
+    assert len(logic._request_queue) == 0
+
+    logic.become_candidate()
+    logic._send_heartbeats()
+    assert len(logic._request_queue) == 0
+
+    # sends heartbeats if the current server is a leader
+    logic.become_leader()
+    logic._send_heartbeats()
+    assert len(logic._request_queue) == 2
+    assert logic._request_queue.pop() == (3, AppendEntriesRequest(
+                                                term=1,
+                                                leader_id=1,
+                                                prev_log_index=0,
+                                                prev_log_term=0,
+                                                leader_commit=0,
+                                                entries=[]
+                                            )
+                                        )
+    
+    assert logic._request_queue.pop() == (2, AppendEntriesRequest(
+                                                term=1,
+                                                leader_id=1,
+                                                prev_log_index=0,
+                                                prev_log_term=0,
+                                                leader_commit=0,
+                                                entries=[]
+                                            )
+                                        )
+
 if __name__ == "__main__":
     test_handle_append_entries()
     test_add_command()
@@ -761,3 +1087,6 @@ if __name__ == "__main__":
     test_update_commit_index()
     test_handle_vote_request_request()
     test_handle_vote_request_response()
+    test_run_heartbeat_check()
+    test_run_election_check()
+    test_send_heartbeats()
